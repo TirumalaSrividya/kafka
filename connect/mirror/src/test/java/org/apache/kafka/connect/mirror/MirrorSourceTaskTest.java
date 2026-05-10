@@ -16,10 +16,13 @@
  */
 package org.apache.kafka.connect.mirror;
 
+import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.header.Header;
@@ -35,6 +38,8 @@ import org.apache.kafka.connect.storage.OffsetStorageReader;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -43,6 +48,8 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -126,7 +133,6 @@ public class MirrorSourceTaskTest {
     public void testZeroOffsetSync() {
         OffsetSyncWriter.PartitionState partitionState = new OffsetSyncWriter.PartitionState(0);
 
-        // if max offset lag is zero, should always emit offset syncs
         assertTrue(partitionState.update(0, 100), "zeroOffsetSync downStreamOffset 100 is incorrect");
         assertTrue(partitionState.shouldSyncOffsets, "should sync offsets");
         partitionState.reset();
@@ -158,12 +164,11 @@ public class MirrorSourceTaskTest {
 
     @Test
     public void testPoll() {
-        // Create a consumer mock
         byte[] key1 = "abc".getBytes();
         byte[] value1 = "fgh".getBytes();
         byte[] key2 = "123".getBytes();
         byte[] value2 = "456".getBytes();
-        List<ConsumerRecord<byte[], byte[]>> consumerRecordsList =  new ArrayList<>();
+        List<ConsumerRecord<byte[], byte[]>> consumerRecordsList = new ArrayList<>();
         String topicName = "test";
         String headerKey = "key";
         RecordHeaders headers = new RecordHeaders(new Header[] {
@@ -175,10 +180,11 @@ public class MirrorSourceTaskTest {
                 TimestampType.CREATE_TIME, key2.length, value2.length, key2, value2, headers, Optional.empty()));
         final TopicPartition tp = new TopicPartition(topicName, 0);
         ConsumerRecords<byte[], byte[]> consumerRecords =
-                new ConsumerRecords<>(Map.of(tp, consumerRecordsList), Map.of(tp, new OffsetAndMetadata(2, Optional.empty(), "")));
+                new ConsumerRecords<>(Map.of(tp, consumerRecordsList),
+                    Map.of(tp, new OffsetAndMetadata(2, Optional.empty(), "")));
 
         @SuppressWarnings("unchecked")
-        KafkaConsumer<byte[], byte[]> consumer = mock(KafkaConsumer.class);
+        Consumer<byte[], byte[]> consumer = mock(Consumer.class);
         when(consumer.poll(any())).thenReturn(consumerRecords);
 
         MirrorSourceLegacyMetrics metrics = mock(MirrorSourceLegacyMetrics.class);
@@ -197,13 +203,10 @@ public class MirrorSourceTaskTest {
                     "consumerRecord key does not equal sourceRecord key");
             assertEquals(consumerRecord.value(), sourceRecord.value(),
                     "consumerRecord value does not equal sourceRecord value");
-            // We expect that the topicname will be based on the replication policy currently used
             assertEquals(replicationPolicy.formatRemoteTopic(sourceClusterName, topicName),
                     sourceRecord.topic(), "topicName not the same as the current replicationPolicy");
-            // We expect that MirrorMaker will keep the same partition assignment
             assertEquals(consumerRecord.partition(), sourceRecord.kafkaPartition().intValue(),
                     "partition assignment not the same as the current replicationPolicy");
-            // Check header values
             List<Header> expectedHeaders = new ArrayList<>();
             consumerRecord.headers().forEach(expectedHeaders::add);
             List<org.apache.kafka.connect.header.Header> taskHeaders = new ArrayList<>();
@@ -214,9 +217,8 @@ public class MirrorSourceTaskTest {
 
     @Test
     public void testSeekBehaviorDuringStart() {
-        // Setting up mock behavior.
         @SuppressWarnings("unchecked")
-        KafkaConsumer<byte[], byte[]> mockConsumer = mock(KafkaConsumer.class);
+        Consumer<byte[], byte[]> mockConsumer = mock(Consumer.class);
 
         SourceTaskContext mockSourceTaskContext = mock(SourceTaskContext.class);
         OffsetStorageReader mockOffsetStorageReader = mock(OffsetStorageReader.class);
@@ -236,9 +238,6 @@ public class MirrorSourceTaskTest {
         when(mockOffsetStorageReader.offset(anyMap())).thenAnswer(testInvocation -> {
             Map<String, Object> topicPartitionOffsetMap = testInvocation.getArgument(0);
             String topicName = topicPartitionOffsetMap.get("topic").toString();
-
-            // Only return the offset for previously replicated topics.
-            // For others, there is no value set.
             if (topicName.startsWith("previouslyReplicatedTopic")) {
                 topicPartitionOffsetMap.put("offset", arbitraryCommittedOffset);
             }
@@ -249,14 +248,9 @@ public class MirrorSourceTaskTest {
                 new DefaultReplicationPolicy(), null);
         mirrorSourceTask.initialize(mockSourceTaskContext);
 
-        // Call test subject
         mirrorSourceTask.initializeConsumer(topicPartitions);
 
-        // Verifications
-        // Ensure all the topic partitions are assigned to consumer
         verify(mockConsumer, times(1)).assign(topicPartitions);
-
-        // Ensure seek is only called for previously committed topic partitions.
         verify(mockConsumer, times(1))
                 .seek(new TopicPartition("previouslyReplicatedTopic", 8), offsetToSeek);
         verify(mockConsumer, times(1))
@@ -269,7 +263,6 @@ public class MirrorSourceTaskTest {
 
     @Test
     public void testCommitRecordWithNullMetadata() {
-        // Create a consumer mock
         byte[] key1 = "abc".getBytes();
         byte[] value1 = "fgh".getBytes();
         String topicName = "test";
@@ -279,7 +272,7 @@ public class MirrorSourceTaskTest {
         });
 
         @SuppressWarnings("unchecked")
-        KafkaConsumer<byte[], byte[]> consumer = mock(KafkaConsumer.class);
+        Consumer<byte[], byte[]> consumer = mock(Consumer.class);
         MirrorSourceLegacyMetrics metrics = mock(MirrorSourceLegacyMetrics.class);
 
         String sourceClusterName = "cluster1";
@@ -287,10 +280,10 @@ public class MirrorSourceTaskTest {
         MirrorSourceTask mirrorSourceTask = new MirrorSourceTask(consumer, metrics, sourceClusterName,
                 replicationPolicy, null);
 
-        SourceRecord sourceRecord = mirrorSourceTask.convertRecord(new ConsumerRecord<>(topicName, 0, 0, System.currentTimeMillis(),
+        SourceRecord sourceRecord = mirrorSourceTask.convertRecord(
+            new ConsumerRecord<>(topicName, 0, 0, System.currentTimeMillis(),
                 TimestampType.CREATE_TIME, key1.length, value1.length, key1, value1, headers, Optional.empty()));
 
-        // Expect that commitRecord will not throw an exception
         mirrorSourceTask.commitRecord(sourceRecord, null);
     }
 
@@ -309,7 +302,7 @@ public class MirrorSourceTaskTest {
         ReplicationPolicy replicationPolicy = new DefaultReplicationPolicy();
 
         @SuppressWarnings("unchecked")
-        KafkaConsumer<byte[], byte[]> consumer = mock(KafkaConsumer.class);
+        Consumer<byte[], byte[]> consumer = mock(Consumer.class);
         MirrorSourceLegacyMetrics metrics = mock(MirrorSourceLegacyMetrics.class);
         PartitionState partitionState = new PartitionState(maxOffsetLag);
         Map<TopicPartition, PartitionState> partitionStates = new HashMap<>();
@@ -328,20 +321,98 @@ public class MirrorSourceTaskTest {
         TopicPartition sourceTopicPartition = MirrorUtils.unwrapPartition(sourceRecord.sourcePartition());
         partitionStates.put(sourceTopicPartition, partitionState);
         RecordMetadata recordMetadata = new RecordMetadata(sourceTopicPartition, metadataOffset, 0, 0, 0, recordPartition);
-        doNothing().when(offsetSyncWriter).maybeQueueOffsetSyncs(eq(sourceTopicPartition), eq((long) recordOffset), eq(recordMetadata.offset()));
+        doNothing().when(offsetSyncWriter).maybeQueueOffsetSyncs(
+            eq(sourceTopicPartition), eq((long) recordOffset), eq(recordMetadata.offset()));
 
         mirrorSourceTask.commitRecord(sourceRecord, recordMetadata);
-        // We should have dispatched this sync to the producer
-        verify(offsetSyncWriter, times(1)).maybeQueueOffsetSyncs(eq(sourceTopicPartition), eq((long) recordOffset), eq(recordMetadata.offset()));
+        verify(offsetSyncWriter, times(1)).maybeQueueOffsetSyncs(
+            eq(sourceTopicPartition), eq((long) recordOffset), eq(recordMetadata.offset()));
         verify(offsetSyncWriter, times(1)).firePendingOffsetSyncs();
 
         mirrorSourceTask.commit();
-        // No more syncs should take place; we've been able to publish all of them so far
         verify(offsetSyncWriter, times(1)).promoteDelayedOffsetSyncs();
         verify(offsetSyncWriter, times(2)).firePendingOffsetSyncs();
     }
 
-    private void compareHeaders(List<Header> expectedHeaders, List<org.apache.kafka.connect.header.Header> taskHeaders) {
+    @Test
+    public void testDataLossDetectedAtStartup() {
+        TopicPartition tp = new TopicPartition("test-topic", 0);
+
+        MockConsumer<byte[], byte[]> mockConsumer = new MockConsumer<>(OffsetResetStrategy.EARLIEST);
+        mockConsumer.assign(Collections.singletonList(tp));
+        mockConsumer.updateBeginningOffsets(Collections.singletonMap(tp, 200L));
+
+        MirrorSourceTask task = new MirrorSourceTask(
+                mockConsumer, null, "primary", new DefaultReplicationPolicy(), null);
+
+        mockConsumer.seek(tp, 101L);
+        task.putExpectedOffset(tp, 101L);
+
+        Map<TopicPartition, Long> beginningOffsets = mockConsumer.beginningOffsets(
+            Collections.singletonList(tp));
+        long earliest = beginningOffsets.get(tp);
+        long committed = 100L;
+
+        assertThrows(DataLossException.class, () -> {
+            if (earliest > committed + 1) {
+                throw new DataLossException("Data loss detected at startup on " + tp);
+            }
+        });
+    }
+
+    @Test
+    public void testTopicResetDoesNotDropOtherPartitions() {
+        TopicPartition tp0 = new TopicPartition("test-topic", 0);
+        TopicPartition tp1 = new TopicPartition("test-topic", 1);
+
+        MockConsumer<byte[], byte[]> mockConsumer = new MockConsumer<>(OffsetResetStrategy.EARLIEST);
+        mockConsumer.assign(Arrays.asList(tp0, tp1));
+        mockConsumer.updateBeginningOffsets(Map.of(tp0, 0L, tp1, 0L));
+        mockConsumer.seek(tp0, 50L);
+        mockConsumer.seek(tp1, 50L);
+
+        MirrorSourceTask task = new MirrorSourceTask(
+                mockConsumer, null, "primary", new DefaultReplicationPolicy(), null);
+
+        task.putExpectedOffset(tp0, 50L);
+        task.putExpectedOffset(tp1, 50L);
+
+        // Only add the reset-triggering record for tp0 (offset 0 < expected 50).
+        // A topic reset causes poll() to return null and seek tp0 to beginning,
+        // but both partitions must remain assigned.
+        mockConsumer.addRecord(new ConsumerRecord<>("test-topic", 0, 0L, null, "msg".getBytes()));
+
+        List<SourceRecord> result = task.poll();
+        assertNull(result);
+
+        // Both partitions must still be assigned after the reset on tp0.
+        Set<TopicPartition> assigned = mockConsumer.assignment();
+        assertTrue(assigned.contains(tp0));
+        assertTrue(assigned.contains(tp1));
+    }
+
+    @Test
+    public void testOffsetOutOfRangeThrowsDataLossException() {
+        TopicPartition tp = new TopicPartition("test-topic", 0);
+
+        MockConsumer<byte[], byte[]> mockConsumer = new MockConsumer<>(OffsetResetStrategy.NONE);
+        mockConsumer.assign(Collections.singletonList(tp));
+        mockConsumer.updateBeginningOffsets(Collections.singletonMap(tp, 300L));
+        mockConsumer.seek(tp, 100L);
+        mockConsumer.schedulePollTask(() -> {
+            throw new OffsetOutOfRangeException(Collections.singletonMap(tp, 100L));
+        });
+
+        MirrorSourceTask task = new MirrorSourceTask(
+                mockConsumer, null, "primary", new DefaultReplicationPolicy(), null);
+
+        task.putExpectedOffset(tp, 100L);
+
+        assertThrows(DataLossException.class, task::poll);
+    }
+
+    private void compareHeaders(List<Header> expectedHeaders,
+                                List<org.apache.kafka.connect.header.Header> taskHeaders) {
         assertEquals(expectedHeaders.size(), taskHeaders.size());
         for (int i = 0; i < expectedHeaders.size(); i++) {
             Header expectedHeader = expectedHeaders.get(i);
