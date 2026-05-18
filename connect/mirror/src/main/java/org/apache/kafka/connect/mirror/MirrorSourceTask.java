@@ -162,10 +162,12 @@ public class MirrorSourceTask extends SourceTask {
                 TopicPartition topicPartition = new TopicPartition(converted.topic(), converted.kafkaPartition());
                 long age = System.currentTimeMillis() - record.timestamp();
                 long size = byteSize(record.value());
+                
                 if (legacyMetrics != null) {
                     legacyMetrics.recordAge(topicPartition, age);
                     legacyMetrics.recordBytes(topicPartition, size);
                 } 
+                
                 if (metrics != null) {
                     metrics.recordAge(topicPartition, age);
                     metrics.recordBytes(topicPartition, size);
