@@ -189,7 +189,7 @@ public class MirrorSourceTask extends SourceTask {
             return null;
         } catch (Throwable e) {
             log.error("Failure during poll.", e);
-            //WorkerSourceTasks expects non-zero batch size
+            // allow Connect to deal with the exception
             throw e;
         } finally {
             consumerAccess.release();
