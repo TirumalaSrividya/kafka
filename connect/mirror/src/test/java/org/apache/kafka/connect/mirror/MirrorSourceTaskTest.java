@@ -189,7 +189,9 @@ public class MirrorSourceTaskTest {
         when(consumer.poll(any())).thenReturn(consumerRecords);
 
         MirrorSourceLegacyMetrics metrics = mock(MirrorSourceLegacyMetrics.class);
-
+        // Provide DefaultReplicationPolicy as a required runtime dependency since MirrorSourceTask
+        // assumes a non-null ReplicationPolicy for topic translation, and this test/setup does not
+        // supply an externally configured policy instance.
         String sourceClusterName = "cluster1";
         ReplicationPolicy replicationPolicy = new DefaultReplicationPolicy();
         MirrorSourceTask mirrorSourceTask = new MirrorSourceTask(consumer, metrics, sourceClusterName,
