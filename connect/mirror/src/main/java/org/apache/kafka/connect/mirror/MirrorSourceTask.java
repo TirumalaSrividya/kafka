@@ -183,7 +183,9 @@ public class MirrorSourceTask extends SourceTask {
                 log.trace("Polled {} records from {}.", sourceRecords.size(), records.partitions());
                 return sourceRecords;
             }
-
+        // This block handles the case where the consumer’s offset is outside Kafka’s valid range 
+        // delegates recovery or failure decisions to handleOffsetOutOfRange
+        // safely ends the current poll cycle.
         } catch (OffsetOutOfRangeException e) {
             handleOffsetOutOfRange(e);
             return null;
