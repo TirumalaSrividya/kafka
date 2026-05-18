@@ -66,7 +66,8 @@ public class MirrorSourceTask extends SourceTask {
 
     // Track expected offsets to detect log truncation and topic resets.
     private final Map<TopicPartition, Long> expectedOffsets = new HashMap<>();
-    
+    private final Set<String> compactedTopics = new java.util.HashSet<>();
+
     public MirrorSourceTask() {}
 
     // for testing
@@ -146,7 +147,7 @@ public class MirrorSourceTask extends SourceTask {
                 TopicPartition tp = new TopicPartition(record.topic(), record.partition());
 
                 if (checkOffsetAnomaly(tp, record.offset())) {
-                    return null;
+                    break;
                 }
 
                 SourceRecord converted = convertRecord(record);
@@ -259,6 +260,10 @@ public class MirrorSourceTask extends SourceTask {
                 long earliest = entry.getValue();
                 long committed = topicPartitionOffsets.get(tp);
                 if (earliest > committed + 1) {
+                    if (compactedTopics.contains(tp.topic())) {
+                        log.debug("Startup offset gap on compacted topic {} — not data loss.", tp);
+                        continue;
+                    }
                     log.error("DATA LOSS DETECTED on {} at startup. "
                         + "Committed offset: {}, Earliest available: {}.", tp, committed, earliest);
                     throw new DataLossException("Data loss detected at startup on " + tp);
@@ -312,6 +317,12 @@ public class MirrorSourceTask extends SourceTask {
         }
         long expected = expectedOffsets.get(tp);
         if (isDataLoss(incoming, expected)) {
+            if (compactedTopics.contains(tp.topic())) {
+                log.debug("Offset gap on compacted topic {} (expected={}, got={}). "
+                    + "Normal compaction — advancing expected offset.", tp, expected, incoming);
+                expectedOffsets.put(tp, incoming + 1L);
+                return false;
+            }
             log.error("DATA LOSS DETECTED on {}! Expected offset {}, got {}. "
                 + "Data purged by retention before replication.", tp, expected, incoming);
             throw new DataLossException("Data loss detected on " + tp);
@@ -332,20 +343,45 @@ public class MirrorSourceTask extends SourceTask {
     private void handleOffsetOutOfRange(OffsetOutOfRangeException e) {
         Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(
             e.offsetOutOfRangePartitions().keySet());
+
         for (TopicPartition tp : e.offsetOutOfRangePartitions().keySet()) {
-            Long expected = expectedOffsets.get(tp);
+            Long expected  = expectedOffsets.get(tp);
             Long beginning = beginningOffsets.get(tp);
-            if (expected != null && beginning != null && expected < beginning) {
+
+            // Case A — partition never tracked; no basis to seek anywhere
+            if (expected == null) {
+                log.warn("OffsetOutOfRange on untracked partition {}. "
+                    + "No expected offset recorded — skipping.", tp);
+                continue;
+            }
+
+            // Case B — beginningOffsets returned nothing; cannot decide
+            if (beginning == null) {
+                log.warn("OffsetOutOfRange on {} but beginningOffsets returned null. "
+                    + "Cannot determine cause — letting Connect retry.", tp);
+                continue;
+            }
+
+            // Confirmed data loss: broker log start moved past our expected offset
+            if (expected < beginning) {
                 log.error("DATA LOSS DETECTED: Log truncation on {}. Expected: {}, Earliest: {}",
                     tp, expected, beginning);
                 throw new DataLossException("Log truncation detected on " + tp);
-            } else {
+            }
+
+            // Confirmed topic reset: topic deleted and recreated (beginning reset to 0)
+            if (beginning == 0 && expected > 0) {
                 log.warn("TOPIC RESET DETECTED (OffsetOutOfRange) on {}. "
                     + "Expected offset {}. Timestamp: {}. Seeking to beginning.",
                     tp, expected, new Date());
                 consumer.seekToBeginning(Collections.singletonList(tp));
                 expectedOffsets.put(tp, 0L);
+                continue;
             }
+
+            // Case C — ambiguous (transient error or misconfiguration); do not seek
+            log.warn("Ambiguous OffsetOutOfRange on {}. Expected: {}, Beginning: {}. "
+                + "Not seeking — will retry on next poll.", tp, expected, beginning);
         }
     }
 
@@ -361,5 +397,15 @@ public class MirrorSourceTask extends SourceTask {
 
     public void putExpectedOffset(TopicPartition tp, long offset) {
         expectedOffsets.put(tp, offset);
+    }
+
+    public void markTopicAsCompacted(String topic) {
+        compactedTopics.add(topic);
+    }
+
+    public static class DataLossException extends RuntimeException {
+        public DataLossException(String message) {
+            super(message);
+        }
     }
 }
