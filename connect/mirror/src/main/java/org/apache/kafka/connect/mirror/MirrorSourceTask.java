@@ -16,9 +16,10 @@
  */
 package org.apache.kafka.connect.mirror;
 
+import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
@@ -36,6 +37,9 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -49,9 +53,12 @@ import static org.apache.kafka.connect.mirror.MirrorConnectorConfig.METRIC_NAMES
 public class MirrorSourceTask extends SourceTask {
 
     private static final Logger log = LoggerFactory.getLogger(MirrorSourceTask.class);
-
-    private KafkaConsumer<byte[], byte[]> consumer;
-    private String sourceClusterAlias;
+    // Using Consumer interface instead of KafkaConsumer for testability, flexibilty, loose coupling
+    // testability (supports MockConsumer / mocking)
+    // flexibility (can plug different Consumer implementations)
+    // loose coupling (avoids dependency on concrete KafkaConsumer)
+    private Consumer<byte[], byte[]> consumer;
+    private String sourceClusterAlias; 
     private Duration pollTimeout;
     private ReplicationPolicy replicationPolicy;
     private MirrorSourceLegacyMetrics legacyMetrics;
@@ -60,11 +67,15 @@ public class MirrorSourceTask extends SourceTask {
     private Semaphore consumerAccess;
     private OffsetSyncWriter offsetSyncWriter;
 
+    // Track expected offsets to detect log truncation and topic resets.
+    private final Map<TopicPartition, Long> expectedOffsets = new HashMap<>();
+    private final Set<String> compactedTopics = new java.util.HashSet<>();
+
     public MirrorSourceTask() {}
 
     // for testing
-    MirrorSourceTask(KafkaConsumer<byte[], byte[]> consumer, MirrorSourceLegacyMetrics metrics, String sourceClusterAlias,
-                     ReplicationPolicy replicationPolicy,
+    MirrorSourceTask(Consumer<byte[], byte[]> consumer, MirrorSourceLegacyMetrics metrics,
+                     String sourceClusterAlias, ReplicationPolicy replicationPolicy,
                      OffsetSyncWriter offsetSyncWriter) {
         this.consumer = consumer;
         this.legacyMetrics = metrics;
@@ -77,7 +88,7 @@ public class MirrorSourceTask extends SourceTask {
     @Override
     public void start(Map<String, String> props) {
         MirrorSourceTaskConfig config = new MirrorSourceTaskConfig(props);
-        consumerAccess = new Semaphore(1);  // let one thread at a time access the consumer
+        consumerAccess = new Semaphore(1);
         sourceClusterAlias = config.sourceClusterAlias();
         List<String> metricNamesFormats = config.metricNamesFormats();
         legacyMetrics = metricNamesFormats.contains(METRIC_NAMES_LEGACY) ? config.legacyMetrics() : null;
@@ -97,7 +108,7 @@ public class MirrorSourceTask extends SourceTask {
 
     @Override
     public void commit() {
-        // Handle delayed and pending offset syncs only when offsetSyncWriter is available
+         // Handle delayed and pending offset syncs only when offsetSyncWriter is available
         if (offsetSyncWriter != null) {
             // Offset syncs which were not emitted immediately due to their offset spacing should be sent periodically
             // This ensures that low-volume topics aren't left with persistent lag at the end of the topic
@@ -116,14 +127,14 @@ public class MirrorSourceTask extends SourceTask {
         try {
             consumerAccess.acquire();
         } catch (InterruptedException e) {
-            log.warn("Interrupted waiting for access to consumer. Will try closing anyway."); 
+            log.warn("Interrupted waiting for access to consumer. Will try closing anyway.");
         }
         Utils.closeQuietly(consumer, "source consumer");
         Utils.closeQuietly(offsetSyncWriter, "offset sync writer");
         Utils.closeQuietly(legacyMetrics, "metrics");
         log.info("Stopping {} took {} ms.", Thread.currentThread().getName(), System.currentTimeMillis() - start);
     }
-   
+
     @Override
     public String version() {
         return new MirrorSourceConnector().version();
@@ -141,15 +152,26 @@ public class MirrorSourceTask extends SourceTask {
             ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);
             List<SourceRecord> sourceRecords = new ArrayList<>(records.count());
             for (ConsumerRecord<byte[], byte[]> record : records) {
+                // TopicPartition is required because offset tracking and anomaly detection are maintained per partition.
+                // Kafka guarantees ordering only within a partition, so correctness must be validated at the topic-partition level.
+
+                TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+                // Ensures replication correctness by detecting offset gaps, resets, or data loss per partition
+                if (checkOffsetAnomaly(tp, record.offset())) {
+                    break;
+                }
+
                 SourceRecord converted = convertRecord(record);
                 sourceRecords.add(converted);
                 TopicPartition topicPartition = new TopicPartition(converted.topic(), converted.kafkaPartition());
                 long age = System.currentTimeMillis() - record.timestamp();
                 long size = byteSize(record.value());
+                
                 if (legacyMetrics != null) {
                     legacyMetrics.recordAge(topicPartition, age);
                     legacyMetrics.recordBytes(topicPartition, size);
-                }
+                } 
+                
                 if (metrics != null) {
                     metrics.recordAge(topicPartition, age);
                     metrics.recordBytes(topicPartition, size);
@@ -162,12 +184,18 @@ public class MirrorSourceTask extends SourceTask {
                 log.trace("Polled {} records from {}.", sourceRecords.size(), records.partitions());
                 return sourceRecords;
             }
+        // This block handles the case where the consumer’s offset is outside Kafka’s valid range 
+        // delegates recovery or failure decisions to handleOffsetOutOfRange
+        // safely ends the current poll cycle.
+        } catch (OffsetOutOfRangeException e) {
+            handleOffsetOutOfRange(e);
+            return null;
         } catch (WakeupException e) {
             return null;
         } catch (KafkaException e) {
             log.warn("Failure during poll.", e);
             return null;
-        } catch (Throwable e)  {
+        } catch (Throwable e) {
             log.error("Failure during poll.", e);
             // allow Connect to deal with the exception
             throw e;
@@ -175,14 +203,14 @@ public class MirrorSourceTask extends SourceTask {
             consumerAccess.release();
         }
     }
- 
     @Override
     public void commitRecord(SourceRecord record, RecordMetadata metadata) {
         if (stopping) {
             return;
         }
         if (metadata == null) {
-            log.debug("No RecordMetadata (source record was probably filtered out during transformation) -- can't sync offsets for {}.", record.topic());
+            log.debug("No RecordMetadata (record filtered during transformation) "
+                + "-- can't sync offsets for {}.", record.topic());
             return;
         }
         if (!metadata.hasOffset()) {
@@ -191,14 +219,8 @@ public class MirrorSourceTask extends SourceTask {
         }
         TopicPartition topicPartition = new TopicPartition(record.topic(), record.kafkaPartition());
         long latency = System.currentTimeMillis() - record.timestamp();
-        if (legacyMetrics != null) {
-            legacyMetrics.countRecord(topicPartition);
-            legacyMetrics.replicationLatency(topicPartition, latency);
-        }
-        if (metrics != null) {
-            metrics.countRecord(topicPartition);
-            metrics.replicationLatency(topicPartition, latency);
-        }
+        metrics.countRecord(topicPartition);
+        metrics.replicationLatency(topicPartition, latency);
         // Queue offset syncs only when offsetWriter is available
         if (offsetSyncWriter != null) {
             TopicPartition sourceTopicPartition = MirrorUtils.unwrapPartition(record.sourcePartition());
@@ -207,9 +229,10 @@ public class MirrorSourceTask extends SourceTask {
             offsetSyncWriter.maybeQueueOffsetSyncs(sourceTopicPartition, upstreamOffset, downstreamOffset);
             // We may be able to immediately publish an offset sync that we've queued up here
             offsetSyncWriter.firePendingOffsetSyncs();
+            
         }
     }
- 
+
     private Map<TopicPartition, Long> loadOffsets(Set<TopicPartition> topicPartitions) {
         return topicPartitions.stream().collect(Collectors.toMap(x -> x, this::loadOffset));
     }
@@ -224,32 +247,60 @@ public class MirrorSourceTask extends SourceTask {
     void initializeConsumer(Set<TopicPartition> taskTopicPartitions) {
         Map<TopicPartition, Long> topicPartitionOffsets = loadOffsets(taskTopicPartitions);
         consumer.assign(topicPartitionOffsets.keySet());
-        log.info("Starting with {} previously uncommitted partitions.", topicPartitionOffsets.values().stream()
-                .filter(this::isUncommitted).count());
+        log.info("Starting with {} previously uncommitted partitions.",
+            topicPartitionOffsets.values().stream().filter(this::isUncommitted).count());
 
         topicPartitionOffsets.forEach((topicPartition, offset) -> {
-            // Do not call seek on partitions that don't have an existing offset committed.
             if (isUncommitted(offset)) {
-                log.trace("Skipping seeking offset for topicPartition: {}", topicPartition);
+                log.trace("Skipping seek for uncommitted partition: {}", topicPartition);
                 return;
             }
-            long nextOffsetToCommittedOffset = offset + 1L;
-            log.trace("Seeking to offset {} for topicPartition: {}", nextOffsetToCommittedOffset, topicPartition);
-            consumer.seek(topicPartition, nextOffsetToCommittedOffset);
+            long nextOffset = offset + 1L;
+            log.trace("Seeking to offset {} for topicPartition: {}", nextOffset, topicPartition);
+            consumer.seek(topicPartition, nextOffset);
+            expectedOffsets.put(topicPartition, nextOffset);
         });
+
+        // Check for data loss at startup — broker may have purged data since last commit.
+        Set<TopicPartition> seededPartitions = topicPartitionOffsets.entrySet().stream()
+            .filter(e -> !isUncommitted(e.getValue()))
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toSet());
+
+        // This block ensures that at startup Kafka still contains all data beyond the last committed offset
+        // the earliest available offset has moved ahead indicates retention-based data loss
+        // except for compacted topics where such gaps are expected.
+        
+        if (!seededPartitions.isEmpty()) {
+            Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(seededPartitions);
+            for (Map.Entry<TopicPartition, Long> entry : beginningOffsets.entrySet()) {
+                TopicPartition tp = entry.getKey();
+                long earliest = entry.getValue();
+                long committed = topicPartitionOffsets.get(tp);
+                if (earliest > committed + 1) {
+                    if (compactedTopics.contains(tp.topic())) {
+                        log.debug("Startup offset gap on compacted topic {} — not data loss.", tp);
+                        continue;
+                    }
+                    log.error("DATA LOSS DETECTED on {} at startup. "
+                        + "Committed offset: {}, Earliest available: {}.", tp, committed, earliest);
+                    throw new DataLossException("Data loss detected at startup on " + tp);
+                }
+            }
+        }
     }
 
-    // visible for testing 
+    // visible for testing
     SourceRecord convertRecord(ConsumerRecord<byte[], byte[]> record) {
         String targetTopic = formatRemoteTopic(record.topic());
         Headers headers = convertHeaders(record);
         return new SourceRecord(
-                MirrorUtils.wrapPartition(new TopicPartition(record.topic(), record.partition()), sourceClusterAlias),
-                MirrorUtils.wrapOffset(record.offset()),
-                targetTopic, record.partition(),
-                Schema.OPTIONAL_BYTES_SCHEMA, record.key(),
-                Schema.BYTES_SCHEMA, record.value(),
-                record.timestamp(), headers);
+            MirrorUtils.wrapPartition(new TopicPartition(record.topic(), record.partition()), sourceClusterAlias),
+            MirrorUtils.wrapOffset(record.offset()),
+            targetTopic, record.partition(),
+            Schema.OPTIONAL_BYTES_SCHEMA, record.key(),
+            Schema.BYTES_SCHEMA, record.value(),
+            record.timestamp(), headers);
     }
 
     private Headers convertHeaders(ConsumerRecord<byte[], byte[]> record) {
@@ -271,8 +322,114 @@ public class MirrorSourceTask extends SourceTask {
             return bytes.length;
         }
     }
-
+    
+    // isUncommitted() determines whether a valid offset checkpoint exists for the partition.
+    // Null/negative offsets are treated as absence of state, triggering initialization flow instead of resume-seek
+    // to avoid invalid offset positioning and ensure safe startup semantics.
     private boolean isUncommitted(Long offset) {
         return offset == null || offset < 0;
+    }
+
+    // checkOffsetAnomaly() is used to validate Kafka offset progression per partition,
+    // ensuring correctness during replication by handling normal sequencing,
+    // detecting data loss due to retention, and identifying topic resets safely.
+    private boolean checkOffsetAnomaly(TopicPartition tp, long incoming) {
+        if (!expectedOffsets.containsKey(tp)) {
+            log.info("First record seen for {}. Baselining expected offset at {}.", tp, incoming);
+            expectedOffsets.put(tp, incoming + 1L);
+            return false;
+        }
+        long expected = expectedOffsets.get(tp);
+        if (isDataLoss(incoming, expected)) {
+            if (compactedTopics.contains(tp.topic())) {
+                log.debug("Offset gap on compacted topic {} (expected={}, got={}). "
+                    + "Normal compaction — advancing expected offset.", tp, expected, incoming);
+                expectedOffsets.put(tp, incoming + 1L);
+                return false;
+            }
+            log.error("DATA LOSS DETECTED on {}! Expected offset {}, got {}. "
+                + "Data purged by retention before replication.", tp, expected, incoming);
+            throw new DataLossException("Data loss detected on " + tp);
+        }
+        if (isTopicReset(incoming, expected)) {
+            log.error("TOPIC RESET DETECTED on {}! Expected offset {}, got {}. "
+                + "Timestamp: {}. Topic was likely deleted and recreated.",
+                tp, expected, incoming, new Date());
+            log.info("Seeking {} to beginning for automatic recovery.", tp);
+            consumer.seekToBeginning(Collections.singletonList(tp));
+            expectedOffsets.put(tp, 0L);
+            return true;
+        }
+        expectedOffsets.put(tp, incoming + 1L);
+        return false;
+    }
+
+    private void handleOffsetOutOfRange(OffsetOutOfRangeException e) {
+        Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(
+            e.offsetOutOfRangePartitions().keySet());
+
+        for (TopicPartition tp : e.offsetOutOfRangePartitions().keySet()) {
+            Long expected  = expectedOffsets.get(tp);
+            Long beginning = beginningOffsets.get(tp);
+
+            // Case A — partition never tracked; no basis to seek anywhere
+            if (expected == null) {
+                log.warn("OffsetOutOfRange on untracked partition {}. "
+                    + "No expected offset recorded — skipping.", tp);
+                continue;
+            }
+
+            // Case B — beginningOffsets returned nothing; cannot decide
+            if (beginning == null) {
+                log.warn("OffsetOutOfRange on {} but beginningOffsets returned null. "
+                    + "Cannot determine cause — letting Connect retry.", tp);
+                continue;
+            }
+
+            // Confirmed data loss: broker log start moved past our expected offset
+            if (expected < beginning) {
+                log.error("DATA LOSS DETECTED: Log truncation on {}. Expected: {}, Earliest: {}",
+                    tp, expected, beginning);
+                throw new DataLossException("Log truncation detected on " + tp);
+            }
+
+            // Confirmed topic reset: topic deleted and recreated (beginning reset to 0)
+            if (beginning == 0 && expected > 0) {
+                log.warn("TOPIC RESET DETECTED (OffsetOutOfRange) on {}. "
+                    + "Expected offset {}. Timestamp: {}. Seeking to beginning.",
+                    tp, expected, new Date());
+                consumer.seekToBeginning(Collections.singletonList(tp));
+                expectedOffsets.put(tp, 0L);
+                continue;
+            }
+
+            // Case C — ambiguous (transient error or misconfiguration); do not seek
+            log.warn("Ambiguous OffsetOutOfRange on {}. Expected: {}, Beginning: {}. "
+                + "Not seeking — will retry on next poll.", tp, expected, beginning);
+        }
+    }
+
+    // Returns true if incoming offset jumped forward — data purged before replication.
+    private boolean isDataLoss(long incoming, long expected) {
+        return incoming > expected;
+    }
+
+    // Returns true if incoming offset went backward — topic deleted and recreated.
+    private boolean isTopicReset(long incoming, long expected) {
+        return incoming < expected;
+    }
+
+    public void putExpectedOffset(TopicPartition tp, long offset) {
+        expectedOffsets.put(tp, offset);
+    }
+
+    public void markTopicAsCompacted(String topic) {
+        compactedTopics.add(topic);
+    }
+
+    public static class DataLossException extends RuntimeException {
+        public DataLossException(String message) {
+            super(message);
+        }
     }
 }
