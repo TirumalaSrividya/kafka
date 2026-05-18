@@ -165,7 +165,7 @@ public class MirrorSourceTask extends SourceTask {
                 if (legacyMetrics != null) {
                     legacyMetrics.recordAge(topicPartition, age);
                     legacyMetrics.recordBytes(topicPartition, size);
-                }
+                } 
                 if (metrics != null) {
                     metrics.recordAge(topicPartition, age);
                     metrics.recordBytes(topicPartition, size);
