@@ -149,9 +149,10 @@ public class MirrorSourceTask extends SourceTask {
             ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);
             List<SourceRecord> sourceRecords = new ArrayList<>(records.count());
             for (ConsumerRecord<byte[], byte[]> record : records) {
-                // Use TopicPartition to track offset correctness per partition as Kafka guarantees ordering only at partition level.
+                // Needed for per-partition offset tracking and anomaly detection since Kafka ordering
+                // guarantees apply only within a partition (topic + partition is the unique stream key)
                 TopicPartition tp = new TopicPartition(record.topic(), record.partition());
-                // Ensures replication correctness by detecting offset gaps, resets, or data loss per partition
+               
                 if (checkOffsetAnomaly(tp, record.offset())) {
                     break;
                 }
