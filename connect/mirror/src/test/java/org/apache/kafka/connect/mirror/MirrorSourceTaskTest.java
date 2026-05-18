@@ -217,7 +217,7 @@ public class MirrorSourceTaskTest {
 
     @Test
     public void testSeekBehaviorDuringStart() {
-        // Setting up mock behaviour.
+        // Setting up mock behavior.
         @SuppressWarnings("unchecked")
         Consumer<byte[], byte[]> mockConsumer = mock(Consumer.class);
 
