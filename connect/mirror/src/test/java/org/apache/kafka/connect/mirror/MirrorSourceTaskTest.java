@@ -171,16 +171,14 @@ public class MirrorSourceTaskTest {
         byte[] value2 = "456".getBytes();
         List<ConsumerRecord<byte[], byte[]>> consumerRecordsList = new ArrayList<>();
         String topicName = "test";
-        String headerkey = "key";
+        String headerKey = "key";
         RecordHeaders headers = new RecordHeaders(new Header[] {
-            new RecordHeader(headerkey, "value".getBytes()),
+            new RecordHeader(headerKey, "value".getBytes()),
         });
-        consumerRecordsList.add(new ConsumerRecord<>(topicName, 0, 0,
-                System.currentTimeMillis(), TimestampType.CREATE_TIME,
-                key1.length, value1.length, key1, value1, headers, Optional.empty()));
-        consumerRecordsList.add(new ConsumerRecord<>(topicName, 1, 1,
-                System.currentTimeMillis(), TimestampType.CREATE_TIME,
-                key2.length, value2.length, key2, value2, headers, Optional.empty()));
+        consumerRecordsList.add(new ConsumerRecord<>(topicName, 0, 0,System.currentTimeMillis(),                                                                                             
+             TimestampType.CREATE_TIME, key1.length, value1.length, key1, value1, headers, Optional.empty()));
+        consumerRecordsList.add(new ConsumerRecord<>(topicName, 1, 1, System.currentTimeMillis(), 
+            TimestampType.CREATE_TIME, key2.length, value2.length, key2, value2, headers, Optional.empty()));
         final TopicPartition tp = new TopicPartition(topicName, 0);
         ConsumerRecords<byte[], byte[]> consumerRecords = new ConsumerRecords<>(
                 Map.of(tp, consumerRecordsList),
