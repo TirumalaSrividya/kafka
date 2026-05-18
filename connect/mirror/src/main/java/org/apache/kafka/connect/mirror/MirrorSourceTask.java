@@ -152,7 +152,7 @@ public class MirrorSourceTask extends SourceTask {
             ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);
             List<SourceRecord> sourceRecords = new ArrayList<>(records.count());
             for (ConsumerRecord<byte[], byte[]> record : records) {
-                // Used TopicPartition to track offset correctness per partition (Kafka guarantees ordering only within a partition)
+                // This block adds TopicPartition to track offset correctness per partition (Kafka guarantees ordering only within a partition)
 
                 TopicPartition tp = new TopicPartition(record.topic(), record.partition());
                 // Ensures replication correctness by detecting offset gaps, resets, or data loss per partition
