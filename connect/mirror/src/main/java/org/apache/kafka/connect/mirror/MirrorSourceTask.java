@@ -323,15 +323,16 @@ public class MirrorSourceTask extends SourceTask {
         }
     }
     
-    // isUncommitted() identifies whether a partition has valid previous progress or not.
-    
+    // isUncommitted() determines whether a valid offset checkpoint exists for the partition.
+    // Null/negative offsets are treated as absence of state, triggering initialization flow instead of resume-seek
+    // to avoid invalid offset positioning and ensure safe startup semantics.
     private boolean isUncommitted(Long offset) {
         return offset == null || offset < 0;
     }
 
-    // checkOffsetAnomaly() ensures Kafka MirrorMaker never silently skips or misorders data 
-    //continuously validating that incoming offsets match expected progression per partition, 
-    // while distinguishing between real data loss, topic reset, and normal compaction behavior.
+    // checkOffsetAnomaly() is used to validate Kafka offset progression per partition,
+    // ensuring correctness during replication by handling normal sequencing,
+    // detecting data loss due to retention, and identifying topic resets safely.
     private boolean checkOffsetAnomaly(TopicPartition tp, long incoming) {
         if (!expectedOffsets.containsKey(tp)) {
             log.info("First record seen for {}. Baselining expected offset at {}.", tp, incoming);
