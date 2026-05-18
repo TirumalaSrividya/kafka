@@ -286,13 +286,16 @@ public class MirrorSourceTaskTest {
 
         @SuppressWarnings("unchecked")
         Consumer<byte[], byte[]> consumer = mock(Consumer.class);
-        MirrorSourceLegacyMetrics metrics = mock(MirrorSourceLegacyMetrics.class);
-        
+        MirrorSourceLegacyMetrics 
+          
+        // Explicitly instantiate DefaultReplicationPolicy to avoid null dependency and ensure
+        // MirrorSourceTask has a concrete, deterministic topic mapping strategy at runtime when
+        // no external ReplicationPolicy is injected via configuration or dependency injection.
         String sourceClusterName = "cluster1";
         ReplicationPolicy replicationPolicy = new DefaultReplicationPolicy();
         MirrorSourceTask mirrorSourceTask = new MirrorSourceTask(consumer, metrics, sourceClusterName,
                 new DefaultReplicationPolicy(), null);
-
+        
         SourceRecord sourceRecord = mirrorSourceTask.convertRecord(
                 new ConsumerRecord<>("test", 0, 0, System.currentTimeMillis(),
                         TimestampType.CREATE_TIME, key1.length, value1.length, key1, value1, headers, Optional.empty()));
