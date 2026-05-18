@@ -53,7 +53,7 @@ import static org.apache.kafka.connect.mirror.MirrorConnectorConfig.METRIC_NAMES
 public class MirrorSourceTask extends SourceTask {
 
     private static final Logger log = LoggerFactory.getLogger(MirrorSourceTask.class);
-
+    // Use Consumer interface for testability, flexibility, and loose coupling
     private Consumer<byte[], byte[]> consumer;
     private String sourceClusterAlias; 
     private Duration pollTimeout;
