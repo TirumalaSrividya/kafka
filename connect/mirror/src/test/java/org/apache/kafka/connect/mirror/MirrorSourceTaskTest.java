@@ -98,9 +98,9 @@ public class MirrorSourceTaskTest {
         OffsetSyncWriter.PartitionState partitionState = new OffsetSyncWriter.PartitionState(50);
 
         assertTrue(partitionState.update(0, 100), "always emit offset sync on first update");
-        assertTrue(partitionState.shouldSyncOffsets);
+        assertTrue(partitionState.shouldSyncOffsets, "should sync offsets");
         partitionState.reset();
-        assertFalse(partitionState.shouldSyncOffsets);
+        assertFalse(partitionState.shouldSyncOffsets, "should sync offsets to false");
         assertTrue(partitionState.update(2, 102), "upstream offset skipped -> resync");
         partitionState.reset();
         assertFalse(partitionState.update(3, 152), "no sync");
