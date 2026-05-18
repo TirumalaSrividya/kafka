@@ -55,7 +55,7 @@ public class MirrorSourceTask extends SourceTask {
     private static final Logger log = LoggerFactory.getLogger(MirrorSourceTask.class);
 
     private Consumer<byte[], byte[]> consumer;
-    private String sourceClusterAlias;
+    private String sourceClusterAlias; 
     private Duration pollTimeout;
     private ReplicationPolicy replicationPolicy;
     private MirrorSourceLegacyMetrics legacyMetrics;
@@ -105,8 +105,13 @@ public class MirrorSourceTask extends SourceTask {
 
     @Override
     public void commit() {
+         // Handle delayed and pending offset syncs only when offsetSyncWriter is available
         if (offsetSyncWriter != null) {
+            // Offset syncs which were not emitted immediately due to their offset spacing should be sent periodically
+            // This ensures that low-volume topics aren't left with persistent lag at the end of the topic
             offsetSyncWriter.promoteDelayedOffsetSyncs();
+            // Publish any offset syncs that we've queued up, but have not yet been able to publish
+            // (likely because we previously reached our limit for number of outstanding syncs)
             offsetSyncWriter.firePendingOffsetSyncs();
         }
     }
@@ -165,6 +170,7 @@ public class MirrorSourceTask extends SourceTask {
                 }
             }
             if (sourceRecords.isEmpty()) {
+                // WorkerSourceTasks expects non-zero batch size
                 return null;
             } else {
                 log.trace("Polled {} records from {}.", sourceRecords.size(), records.partitions());
@@ -181,6 +187,7 @@ public class MirrorSourceTask extends SourceTask {
             return null;
         } catch (Throwable e) {
             log.error("Failure during poll.", e);
+            //WorkerSourceTasks expects non-zero batch size
             throw e;
         } finally {
             consumerAccess.release();
@@ -193,29 +200,26 @@ public class MirrorSourceTask extends SourceTask {
         }
         if (metadata == null) {
             log.debug("No RecordMetadata (record filtered during transformation) "
-                + "-- cannot sync offsets for {}.", record.topic());
+                + "-- can't sync offsets for {}.", record.topic());
             return;
         }
         if (!metadata.hasOffset()) {
-            log.error("RecordMetadata has no offset -- cannot sync offsets for {}.", record.topic());
+            log.error("RecordMetadata has no offset -- can't sync offsets for {}.", record.topic());
             return;
         }
         TopicPartition topicPartition = new TopicPartition(record.topic(), record.kafkaPartition());
         long latency = System.currentTimeMillis() - record.timestamp();
-        if (legacyMetrics != null) {
-            legacyMetrics.countRecord(topicPartition);
-            legacyMetrics.replicationLatency(topicPartition, latency);
-        }
-        if (metrics != null) {
-            metrics.countRecord(topicPartition);
-            metrics.replicationLatency(topicPartition, latency);
-        }
+        metrics.countRecord(topicPartition);
+        metrics.replicationLatency(topicPartition, latency);
+        // Queue offset syncs only when offsetWriter is available
         if (offsetSyncWriter != null) {
             TopicPartition sourceTopicPartition = MirrorUtils.unwrapPartition(record.sourcePartition());
             long upstreamOffset = MirrorUtils.unwrapOffset(record.sourceOffset());
             long downstreamOffset = metadata.offset();
             offsetSyncWriter.maybeQueueOffsetSyncs(sourceTopicPartition, upstreamOffset, downstreamOffset);
+            // We may be able to immediately publish an offset sync that we've queued up here
             offsetSyncWriter.firePendingOffsetSyncs();
+            
         }
     }
 
