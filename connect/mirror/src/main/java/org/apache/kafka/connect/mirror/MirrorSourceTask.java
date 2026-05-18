@@ -267,14 +267,9 @@ public class MirrorSourceTask extends SourceTask {
             .map(Map.Entry::getKey)
             .collect(Collectors.toSet());
 
-        // At startup, validate that required replication data is still available in Kafka.
-        // This compares the last committed offset with the earliest available offset in the log.
-        //
-        // If earliest > committed + 1, it indicates that Kafka has removed unreplicated data,
-        // typically due to retention policies (time or size-based deletion).
-        //
-        // Log-compacted topics are excluded because compaction removes older records
-        // while retaining the latest value per key, making such gaps expected and non-critical.
+        // This block ensures that at startup Kafka still contains all data beyond the last committed offset
+        // the earliest available offset has moved ahead indicates retention-based data loss
+        // except for compacted topics where such gaps are expected.
         
         if (!seededPartitions.isEmpty()) {
             Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(seededPartitions);
