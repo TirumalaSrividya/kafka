@@ -126,7 +126,7 @@ public class MirrorSourceTaskTest {
         assertTrue(partitionState.update(10, 57), "sync");
         partitionState.reset();
         assertFalse(partitionState.update(11, 58), "sync");
-        assertFalse(partitionState.shouldSyncOffsets);
+        assertFalse(partitionState.shouldSyncOffsets, "should sync offsets to false");
     }
 
     @Test
